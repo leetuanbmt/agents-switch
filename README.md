@@ -10,7 +10,7 @@
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey">
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-none-brightgreen">
-  <img alt="tests" src="https://img.shields.io/badge/tests-53%2F53-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-58%2F58-brightgreen">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
@@ -158,18 +158,28 @@ Chạy `agents-switch` (hoặc `claude-switch`, `codex-switch`) không đối s�
 | Lệnh | Mô tả |
 |---|---|
 | `save [name]` | Lưu tài khoản từ `~/.codex/auth.json` (tự giải mã JWT lấy email/plan) |
-| `switch <query>` | Chuyển sang profile theo tên, alias hoặc email |
-| `switch -` | **Quay lại tài khoản trước đó** (tính năng từ `codex-auth`) |
+| `switch <query> [--force]` | Chuyển sang profile theo tên, alias hoặc email |
+| `switch - [--force]` | **Quay lại tài khoản trước đó** (tính năng từ `codex-auth`) |
 | `list` | Danh sách profile Codex, kèm Alias, Email, Plan, Auth Mode |
 | `status` | Tài khoản Codex đang đăng nhập và gói dịch vụ (Pro, Team, etc.) |
-| `next` | Chuyển sang profile Codex kế tiếp |
+| `next [--force]` | Chuyển sang profile Codex kế tiếp |
 | `alias set <q> <alias>` | Gán alias cho profile để switch nhanh |
 | `alias clear <q>` | Xoá alias của profile |
 | `login [--device-auth]` | Chạy `codex login` rồi tự động lưu profile |
 | `export [dir]` | Xuất các snapshot auth thành file `*.auth.json` |
 | `import <path>` | Nhập file hoặc thư mục `*.auth.json` vào profile |
 | `remove <name>` / `--all` | Xoá profile (hoặc xoá toàn bộ với `--all`) |
+| `home add <name> [--device-auth]` | Đăng nhập mới vào home cô lập (xem bên dưới) |
+| `home list [--json]` | Liệt kê home, đường dẫn `CODEX_HOME` và trạng thái đăng nhập |
+| `home run <name> -- <cmd...>` | Chạy lệnh với `CODEX_HOME` riêng |
+| `home remove <name> [--yes]` | Xoá home (mặc định hỏi y/N) |
 | `doctor` | Kiểm tra cấu hình Codex, quyền file, biến `OPENAI_API_KEY` |
+
+### Chặn ghi đè khi switch Codex & home cô lập
+
+Global switch từ chối khi tài khoản hiện tại chưa lưu hoặc Codex đang chạy, vì refresh token của tiến trình cũ có thể ghi đè tài khoản global. Hãy `codex-switch save <name>` và đóng Codex trước; `switch <name>`, `switch -` và `next` hỗ trợ `--force` để bỏ chặn.
+
+Để chạy song song nhiều tài khoản, dùng `home`: mỗi home nằm ở `~/.codex-accounts/homes/<name>` (quyền 700), đăng nhập riêng, không sao chép token, độc lập với snapshot và global switch. `home list` chỉ hỏi `codex login status`, không đọc credential. `home add` sẽ báo lỗi nếu `auth.json` global bị đổi trong lúc đăng nhập.
 
 ---
 
@@ -182,6 +192,7 @@ Chạy `agents-switch` (hoặc `claude-switch`, `codex-switch`) không đối s�
    - Thư mục profile `~/.claude-accounts` và `~/.codex-accounts` được bảo vệ với quyền `chmod 700`.
    - File profile chứa refresh token được bảo vệ với `chmod 600`.
    - Ghi dữ liệu dạng atomic (`os.replace`) tránh hỏng file khi bị ngắt tiến trình.
+   - Trên macOS, credential Claude ghi vào Keychain qua `security -i` (stdin, không lộ trong `ps`). Blob quá lớn (~4096 byte) hoặc nhiều dòng buộc phải truyền qua argv của `/usr/bin/security` để Keychain không hỏi mật khẩu mỗi lần.
    - Sao lưu tự động (giữ 10 bản gần nhất) vào thư mục `backups/` trước mỗi lần ghi đè.
    - Khoá file chống xung đột (`fcntl.flock`) khi có nhiều lệnh chạy cùng lúc.
 
@@ -189,7 +200,7 @@ Chạy `agents-switch` (hoặc `claude-switch`, `codex-switch`) không đối s�
 
 ## Kiểm thử
 
-Bộ kiểm thử tự động gồm 53 checks bao phủ toàn bộ các tính năng của Claude Code và OpenAI Codex:
+Bộ kiểm thử tự động gồm 58 checks bao phủ toàn bộ các tính năng của Claude Code và OpenAI Codex:
 
 ```bash
 ./test.sh
@@ -197,5 +208,5 @@ Bộ kiểm thử tự động gồm 53 checks bao phủ toàn bộ các tính n
 
 Kết quả:
 ```console
-PASS — 53 checks (All Claude Code + OpenAI Codex multi-client tests passed)
+PASS — 58 checks (All Claude Code + OpenAI Codex multi-client tests passed)
 ```
