@@ -30,14 +30,14 @@ Công cụ hỗ trợ nhiều AI Agent clients:
 
 **macOS / Linux / WSL:**
 ```bash
-git clone https://github.com/leetuanbmt/claude-switch.git
-cd claude-switch && ./install.sh
+git clone https://github.com/leetuanbmt/agents-switch.git
+cd agents-switch && ./install.sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/leetuanbmt/claude-switch.git
-cd claude-switch; .\install.ps1
+git clone https://github.com/leetuanbmt/agents-switch.git
+cd agents-switch; .\install.ps1
 ```
 
 Trên macOS/Linux script tạo symlink vào thư mục đầu tiên có trong `PATH` (`~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`):
