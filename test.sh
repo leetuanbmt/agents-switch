@@ -9,6 +9,8 @@ CS="$(cd "$(dirname "$0")" && pwd)/claude-switch"
 SANDBOX=$(mktemp -d)
 trap 'rm -rf "$SANDBOX"' EXIT
 export HOME="$SANDBOX"
+export CODEX_SWITCH_PROCESS_NAME="cs-test-$$"
+unset CODEX_HOME
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -522,7 +524,7 @@ login_codex_as acc-del2 del2@test.com free; "$CX" save del-two >/dev/null
 "$AS" -c codex list | grep -q "PROFILE" || fail "agents-switch -c codex không hoạt động"
 "$AS" --client claude status | grep -q "Đang dùng:" || fail "agents-switch --client claude không hoạt động"
 
-# 54. Keychain backend: payload nhỏ ưu tiên stdin, nén JSON, payload lớn/multiline ghi qua Security.framework (không argv), từ chối khi lỗi, decode hex UTF-8
+# 54. Keychain backend: payload nhỏ ưu tiên stdin, nén JSON, payload lớn/multiline ghi qua argv của security (giữ ACL, không dùng Security.framework), die khi lỗi, decode hex UTF-8
 python3 -c '
 import importlib.machinery, importlib.util, json, os, sys
 
@@ -555,28 +557,30 @@ orig_run = mod.subprocess.run
 mod.subprocess.run = fake_subprocess_run
 
 try:
-    def refused(payload):  # ghi bị từ chối (die → SystemExit) và token không bao giờ đi qua argv
-        calls.clear()
-        try:
-            client.write_creds(payload)
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError("write_creds phải từ chối payload này")
-        assert not any(c[0][0:2] == ["security", "add-generic-password"] for c in calls), "token không được lộ qua argv"
+    def argv_cmd(c):
+        return c[0][0:2] == ["security", "add-generic-password"]
 
-    # Trường hợp 1: Payload lớn (>4000 byte) ghi qua Security.framework, không đi qua security -i hay argv
-    native = []
-    mod.keychain_set_native = lambda svc, user, blob: native.append((svc, blob)) or 0
+    # Trường hợp 1: Payload lớn (>4000 byte) vượt giới hạn security -i, phải ghi nguyên vẹn bằng argv của
+    # /usr/bin/security (cùng binary nằm trong ACL của item, không dùng process khác như Python/ctypes)
     calls.clear()
     big = json.dumps({"token": "a" * 5000}, separators=(",", ":"))
     client.write_creds(big)
-    assert native == [(client.kc_service, big)], "Payload lớn phải được ghi nguyên vẹn qua native"
-    assert calls == [], "Payload lớn không được gọi security CLI (argv/stdin)"
+    assert len(calls) == 1 and argv_cmd(calls[0]), "Payload lớn phải đi qua security add-generic-password"
+    assert calls[0][0][-1] == big and calls[0][0][-2] == "-w", "Payload lớn phải được ghi nguyên vẹn"
+    assert not hasattr(mod, "keychain_set_native"), "Không được ghi Keychain bằng process ngoài /usr/bin/security"
 
-    # Trường hợp 1b: native trả OSStatus != 0 thì báo lỗi
-    mod.keychain_set_native = lambda svc, user, blob: -25293
-    refused(big)
+    # Trường hợp 1b: security báo lỗi thì die, không im lặng
+    def fail_argv(cmd, *args, **kwargs):
+        calls.append((cmd, kwargs))
+        return mod.subprocess.CompletedProcess(cmd, 1, stdout="", stderr="denied")
+    mod.subprocess.run = fail_argv
+    try:
+        client.write_creds(big)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("write_creds phải die khi security lỗi")
+    mod.subprocess.run = fake_subprocess_run
 
     # Trường hợp 2: Payload nhỏ (<4000 byte) ưu tiên gọi security -i để che giấu tham số qua ps
     calls.clear()
@@ -591,12 +595,10 @@ try:
     assert calls[0][0] == ["security", "-i"], "JSON nhiều dòng sau khi nén phải gọi được security -i"
     assert "\n" not in calls[0][1].get("input", "").strip(), "Input security -i không được có newline thừa"
 
-    # Trường hợp 4: Credential không phải JSON chứa newline cũng đi qua native, không qua argv
-    native.clear()
-    mod.keychain_set_native = lambda svc, user, blob: native.append((svc, blob)) or 0
+    # Trường hợp 4: Credential không phải JSON chứa newline không đi qua security -i (không nhận xuống dòng)
     calls.clear()
     client.write_creds("plain-token\nwith-newline")
-    assert native == [(client.kc_service, "plain-token\nwith-newline")] and calls == []
+    assert len(calls) == 1 and argv_cmd(calls[0]) and calls[0][0][-1] == "plain-token\nwith-newline"
 
     # Trường hợp 5: Khi security -i trả mã lỗi (returncode != 0) thì báo lỗi, không fallback sang argv
     def fail_security_i(cmd, *args, **kwargs):
@@ -605,7 +607,14 @@ try:
             return mod.subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unknown error")
         return mod.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
     mod.subprocess.run = fail_security_i
-    refused(json.dumps({"token": "fallback_test"}))
+    calls.clear()
+    try:
+        client.write_creds(json.dumps({"token": "fallback_test"}))
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("write_creds phải die khi security -i lỗi")
+    assert not any(argv_cmd(c) for c in calls), "security -i lỗi không được fallback sang argv"
     assert calls[0][0] == ["security", "-i"], "Trước tiên phải thử security -i"
     mod.subprocess.run = fake_subprocess_run
 
@@ -626,6 +635,93 @@ finally:
     mod.subprocess.run = orig_run
 ' "$AS" || fail "Keychain backend xử lý sai payload lớn, JSON nhiều dòng, hoặc decode hex"
 
-echo "PASS — 54 checks (All Claude Code + OpenAI Codex multi-client tests passed)"
 
+# @pt.id T0001-55
+# @pt.item Unsafe global switches
+# @pt.condition Unsaved auth or running Codex process
+# @pt.expected Refuse without changing auth; force succeeds
+# @pt.target CodexClient.use
+# @pt.method integration
+# @pt.legacy None
+# 55. Chặn switch khi tài khoản chưa lưu
+login_codex_as unsafe unsafe@test.com free
+cp "$HOME/.codex/auth.json" "$SANDBOX/before-auth"
+if "$CX" switch eve >"$SANDBOX/refusal" 2>&1; then fail "switch không chặn tài khoản chưa lưu"; fi
+cmp -s "$HOME/.codex/auth.json" "$SANDBOX/before-auth" || fail "switch từ chối vẫn sửa auth"
+grep -q 'codex-switch save' "$SANDBOX/refusal" || fail "thiếu hướng dẫn save"
+"$CX" switch --force eve >/dev/null
 
+# @pt.id T0001-56
+# @pt.item Running process guard
+# @pt.condition Exact named sleep process exists
+# @pt.expected Refuse and preserve auth; force succeeds
+# @pt.target CodexClient.use
+# @pt.method integration
+# @pt.legacy None
+# 56. Chặn switch khi có tiến trình đang chạy
+mkdir -p "$SANDBOX/bin"
+ln -s /bin/sleep "$SANDBOX/bin/$CODEX_SWITCH_PROCESS_NAME"
+"$SANDBOX/bin/$CODEX_SWITCH_PROCESS_NAME" 60 &
+sleep_pid=$!
+trap 'kill "$sleep_pid" 2>/dev/null || true; rm -rf "$SANDBOX"' EXIT
+for attempt in 1 2 3 4 5; do
+  if pgrep -x "$CODEX_SWITCH_PROCESS_NAME" >/dev/null; then break; fi
+  sleep 0.1
+done
+pgrep -x "$CODEX_SWITCH_PROCESS_NAME" >/dev/null || fail "không dựng được tiến trình test"
+cp "$HOME/.codex/auth.json" "$SANDBOX/before-auth"
+if "$CX" switch frank >"$SANDBOX/refusal" 2>&1; then fail "switch không chặn tiến trình"; fi
+cmp -s "$HOME/.codex/auth.json" "$SANDBOX/before-auth" || fail "chặn tiến trình vẫn sửa auth"
+"$CX" --force switch frank >/dev/null
+kill "$sleep_pid"
+wait "$sleep_pid" 2>/dev/null || true
+trap 'rm -rf "$SANDBOX"' EXIT
+
+# @pt.id T0001-57
+# @pt.item Isolated homes
+# @pt.condition Fake Codex login uses CODEX_HOME
+# @pt.expected Private home; global unchanged; credential-free discovery; run and remove work
+# @pt.target CodexClient.home
+# @pt.method integration
+# @pt.legacy None
+# 57. Home độc lập và khám phá không lộ token
+cat > "$SANDBOX/bin/codex" <<'FAKE'
+#!/bin/sh
+[ "$1" = login ] || exit 2
+if [ "$2" = status ]; then
+  [ -f "$CODEX_HOME/auth.json" ]
+  exit $?
+fi
+printf '{"token":"home-test-secret"}' > "$CODEX_HOME/auth.json"
+if [ "${TAMPER_GLOBAL:-}" = 1 ]; then
+  printf 'tampered' > "$HOME/.codex/auth.json"
+fi
+FAKE
+chmod +x "$SANDBOX/bin/codex"
+export PATH="$SANDBOX/bin:$PATH"
+cp "$HOME/.codex/auth.json" "$SANDBOX/before-auth"
+"$CX" home add parallel --device-auth >/dev/null
+cmp -s "$HOME/.codex/auth.json" "$SANDBOX/before-auth" || fail "home add sửa global auth"
+home_path="$HOME/.codex-accounts/homes/parallel"
+perm=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$home_path")
+[[ "$perm" = 700 ]] || fail "home không có mode 700"
+"$CX" home list --json > "$SANDBOX/homes.json"
+python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); assert rows == [{"name":"parallel","codex_home":sys.argv[2],"logged_in":True}]' "$SANDBOX/homes.json" "$home_path" || fail "home list JSON sai"
+if grep -q home-test-secret "$SANDBOX/homes.json"; then fail "home list lộ token"; fi
+[[ $("$CX" home run parallel -- sh -c 'echo "$CODEX_HOME"') = "$home_path" ]] || fail "home run sai CODEX_HOME"
+if "$CX" home add parallel >/dev/null 2>&1; then fail "cho đăng nhập lại home đã có auth"; fi
+"$CX" home remove parallel --yes >/dev/null
+[[ ! -d "$home_path" ]] || fail "home remove không xoá home"
+
+# @pt.id T0001-58
+# @pt.item Global tampering detection
+# @pt.condition Fake login overwrites global auth
+# @pt.expected Nonzero exit
+# @pt.target CodexClient.home
+# @pt.method integration
+# @pt.legacy None
+# 58. Phát hiện login sửa auth global
+if TAMPER_GLOBAL=1 "$CX" home add tamper >"$SANDBOX/tamper-log" 2>&1; then fail "home add không phát hiện sửa global"; fi
+grep -q 'NGUY HIỂM' "$SANDBOX/tamper-log" || fail "thiếu cảnh báo sửa global"
+
+echo "PASS — 58 checks (All Claude Code + OpenAI Codex multi-client tests passed)"

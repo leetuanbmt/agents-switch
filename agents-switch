@@ -108,22 +108,6 @@ def load_json(path: Path) -> dict:
         return {}
 
 
-def keychain_set_native(service: str, user: str, blob: str) -> int:
-    """Ghi generic password qua Security.framework, trả về OSStatus (0 = thành công).
-
-    Dành cho blob mà `security -i` không nhận (vượt ~4096 byte/dòng, hoặc nhiều dòng):
-    token không đi qua argv nên không lộ trong `ps`.
-    """
-    import ctypes
-    sec = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
-    s, a, b = service.encode(), user.encode(), blob.encode()
-    item = ctypes.c_void_p()
-    rc = sec.SecKeychainFindGenericPassword(None, len(s), s, len(a), a, None, None, ctypes.byref(item))
-    if rc == 0:
-        return sec.SecKeychainItemModifyAttributesAndData(item, None, len(b), b)
-    return sec.SecKeychainAddGenericPassword(None, len(s), s, len(a), a, len(b), b, None)
-
-
 def parse_jwt_payload(token: str) -> dict:
     """Giải mã payload của token JWT (JSON Web Token) mà không cần thư viện bên ngoài.
     
@@ -286,16 +270,18 @@ class ClaudeClient:
             except Exception:
                 user = ""
 
-        # Token không bao giờ đi qua argv (lộ trong `ps`). Dòng lệnh của `security -i` bị giới hạn
-        # ~4096 byte và không chứa được xuống dòng; blob không vừa thì ghi thẳng qua Security.framework.
+        # `security -i` đọc từ stdin nên token không lộ trong `ps`, nhưng giới hạn ~4096 byte/dòng và không
+        # nhận xuống dòng. Blob không vừa thì buộc đi qua argv của chính /usr/bin/security: ghi bằng process
+        # khác (ví dụ Python/Security.framework) không nằm trong ACL của item nên Keychain hỏi mật khẩu mỗi lần.
         q = lambda x: '"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"'
         cmd = f'add-generic-password -U -a {q(user)} -s {q(self.kc_service)} -w {q(blob)}\n'
         if "\n" in blob or len(cmd.encode("utf-8")) >= 4000:
-            rc = keychain_set_native(self.kc_service, user, blob)
-            if rc != 0:
-                die(f"không ghi được Keychain (OSStatus {rc})")
-            return
-        r = subprocess.run(["security", "-i"], input=cmd, text=True, capture_output=True)
+            r = subprocess.run(
+                ["security", "add-generic-password", "-U", "-a", user, "-s", self.kc_service, "-w", blob],
+                capture_output=True, text=True,
+            )
+        else:
+            r = subprocess.run(["security", "-i"], input=cmd, text=True, capture_output=True)
 
         if r.returncode != 0:
             err = r.stderr.strip() if r.stderr else ""
@@ -1073,7 +1059,7 @@ class CodexClient:
             return False
         return r.returncode == 0
 
-    def use(self, query: str):
+    def use(self, query: str, force=False):
         """Chuyển sang một profile Codex."""
         if not query:
             die("Usage: codex-switch switch <name|alias|email>")
@@ -1089,14 +1075,15 @@ class CodexClient:
 
         # Auto-save tài khoản Codex đang dùng nếu đã thay đổi
         cur = self.current_profile()
+        if not force:
+            if not cur and self.auth_file.exists():
+                die("Tài khoản Codex chưa lưu. Chạy codex-switch save <name> trước hoặc dùng --force.")
+            if process_count(os.environ.get("CODEX_SWITCH_PROCESS_NAME", "codex")) > 0:
+                die("Codex đang chạy có thể refresh token cũ và ghi đè auth.json global. Đóng Codex trước hoặc dùng --force.")
         if cur and cur != name:
             self.save(cur, quiet=True)
             print(f"[..] Đã cập nhật profile hiện tại: {cur}")
             self.prev_file.write_text(cur, encoding="utf-8")
-        elif not cur and self.auth_file.exists():
-            print("[!] Tài khoản Codex đang đăng nhập chưa được lưu — sẽ mất truy cập nhanh tới nó.\n"
-                  "    Huỷ (Ctrl-C) rồi chạy: codex-switch save <name>")
-
         self.backup_auth()
         write_json(self.auth_file, creds)
         self.state_file.write_text(name, encoding="utf-8")
@@ -1109,23 +1096,93 @@ class CodexClient:
         print(f"    Đang có {n} tiến trình codex chạy bằng token cũ — khởi động lại Codex CLI / VS Code / Codex App để nhận tài khoản mới."
               if n else "    Khởi động lại Codex client (CLI / VS Code / App) để áp dụng tài khoản mới.")
 
-    def switch_prev(self):
+    def switch_prev(self, force=False):
         """Chuyển về tài khoản Codex trước đó (chức năng `codex-auth switch -`)."""
         if not self.prev_file.exists():
             die("Chưa ghi nhận tài khoản Codex trước đó để chuyển")
         prev = self.prev_file.read_text(encoding="utf-8").strip()
         if not prev or not self.profile_path(prev).exists():
             die(f"Tài khoản trước đó '{prev}' không còn tồn tại")
-        self.use(prev)
+        self.use(prev, force=force)
 
-    def next(self):
+    def next(self, force=False):
         """Chuyển sang profile Codex tiếp theo theo vòng tròn alphabet."""
         names = self.profile_names()
         if not names:
             die("chưa có profile nào")
         last = self.current_profile() or (self.state_file.read_text(encoding="utf-8").strip() if self.state_file.exists() else "")
         idx = names.index(last) if last in names else -1
-        self.use(names[(idx + 1) % len(names)])
+        self.use(names[(idx + 1) % len(names)], force=force)
+
+    def home_path(self, name):
+        """Kiểm tra tên home trước khi truy cập."""
+        self.profile_path(name)
+        return self.acc_dir / "homes" / name
+
+    def home_status(self, path):
+        """Hỏi CLI, không đọc credential của home."""
+        try:
+            return subprocess.run(
+                ["codex", "login", "status", "-c", 'cli_auth_credentials_store="file"'],
+                env={**os.environ, "CODEX_HOME": str(path)},
+                capture_output=True, timeout=20).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def home(self, args):
+        """Quản lý home đăng nhập độc lập, không sao chép snapshot."""
+        action = args[0] if args else ""
+        if action == "list":
+            root = self.acc_dir / "homes"
+            rows = [{"name": p.name, "codex_home": str(p),
+                     "logged_in": self.home_status(p)}
+                    for p in sorted(root.iterdir()) if p.is_dir()] if root.exists() else []
+            if "--json" in args:
+                print(json.dumps(rows, ensure_ascii=False))
+            else:
+                for row in rows:
+                    print(f"{row['name']}  {row['codex_home']}  logged_in={row['logged_in']}")
+            return
+        if action not in ("add", "run", "remove") or len(args) < 2:
+            die("Usage: codex-switch home add|list|run|remove <name>")
+        path = self.home_path(args[1])
+        if action == "add":
+            if self.home_status(path):
+                die("Home đã đăng nhập")
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(path.parent, 0o700)
+            os.chmod(path, 0o700)
+
+            def fingerprint():
+                return hashlib.sha256(self.auth_file.read_bytes()).hexdigest() if self.auth_file.exists() else None
+
+            before = fingerprint()
+            cmd = ["codex", "login", "-c", 'cli_auth_credentials_store="file"']
+            if "--device-auth" in args:
+                cmd.append("--device-auth")
+            try:
+                result = subprocess.run(cmd, env={**os.environ, "CODEX_HOME": str(path)})
+            except FileNotFoundError:
+                die("Không tìm thấy lệnh codex trong PATH")
+            finally:
+                if fingerprint() != before:
+                    die("NGUY HIỂM: đăng nhập home đã thay đổi auth.json global!")
+            print(f"logged_in={self.home_status(path)}")
+            if result.returncode:
+                die(f"codex login thất bại: {result.returncode}")
+        else:
+            if not path.is_dir():
+                die("Không tìm thấy home")
+            if action == "run":
+                if len(args) < 4 or args[2] != "--":
+                    die("Usage: codex-switch home run <name> -- <cmd...>")
+                os.execvpe(args[3], args[3:], {**os.environ, "CODEX_HOME": str(path)})
+            else:
+                if "--yes" not in args and not sys.stdin.isatty():
+                    die("Xoá home khi stdin không phải TTY cần --yes")
+                if "--yes" in args or input("Xoá home? [y/N] ").strip().lower() == "y":
+                    shutil.rmtree(path)
+                    ok("Đã xoá home")
 
     def remove(self, *queries: str, all_profiles: bool = False):
         """Xoá profile Codex (một, nhiều profile, hoặc tất cả)."""
@@ -1894,16 +1951,17 @@ def _ui(scr, client_lock: str = None):
                     return False
         elif cid == "codex":
             if client.auth_file.exists() and not client.current_profile():
-                k = confirm("Tài khoản Codex hiện tại chưa lưu.  [s] lưu rồi chuyển  [c] chuyển luôn  [Esc] huỷ ", "sc")
-                if k is None or (k == "s" and not do_save()):
+                k = confirm("Tài khoản Codex hiện tại chưa lưu.  [s] lưu rồi chuyển  [Esc] huỷ ", "s")
+                if k != "s" or not do_save():
                     return False
         return True
 
     def do_switch(name) -> bool:
         if not guard():
             return False
-        say(*run_quiet(client.use, name))
-        return True
+        good, lines = run_quiet(client.use, name)
+        say(good, lines)
+        return good
 
     def do_remove(name):
         if confirm(f"Xoá profile '{name}'? [y/N] ", "yn") == "y":
@@ -2168,6 +2226,11 @@ def print_codex_help():
   codex-switch login [--device-auth]  Chạy codex login rồi lưu profile
   codex-switch export [dir]  Xuất auth snapshots thành file .auth.json
   codex-switch import <path> Nhập file hoặc thư mục .auth.json vào profile
+  codex-switch home add <name> [--device-auth]  Đăng nhập mới vào home cô lập
+  codex-switch home list [--json]  Liệt kê home không đọc token
+  codex-switch home run <name> -- <cmd...>  Chạy với CODEX_HOME riêng
+  codex-switch home remove <name> [--yes]  Xoá home
+  switch, switch -, next: thêm --force để bỏ chặn tài khoản chưa lưu / Codex đang chạy.
   codex-switch doctor        Kiểm tra cấu hình và quyền bảo mật
   codex-switch version       In phiên bản
 
@@ -2189,7 +2252,7 @@ LỆNH THEO CLIENT CỤ THỂ:
                               save [name], <name>, list, status, usage, next, remove, sync-sessions, doctor
   agents-switch codex <cmd>   Gọi lệnh quản lý OpenAI Codex (tham khảo codex-auth):
                               save [name], switch <name>, switch -, list, status, next, remove,
-                              alias set/clear, login, export, import, doctor
+                              alias set/clear, login, export, import, doctor, home; switch/next [--force]
 
 LỆNH TẮT TƯƠNG THÍCH:
   claude-switch <cmd>         Chạy chế độ Claude Code chuyên biệt (100% tương thích ngược)
@@ -2249,7 +2312,17 @@ def dispatch_claude(c: ClaudeClient, cmd: str, args: list, arg: str):
 
 def dispatch_codex(c: CodexClient, cmd: str, args: list, arg: str):
     """Phân phối lệnh cho client OpenAI Codex."""
-    if cmd == "ui":
+    force = False
+    if cmd == "--force":
+        force = True
+        cmd = args.pop(0) if args else ""
+    if cmd in ("switch", "use", "-", "next"):
+        force = force or "--force" in args
+        args = [a for a in args if a != "--force"]
+    arg = args[0] if args else ""
+    if cmd == "home":
+        c.home(args)
+    elif cmd == "ui":
         start_ui("codex")
     elif cmd == "save":
         with c.lock():
@@ -2257,24 +2330,24 @@ def dispatch_codex(c: CodexClient, cmd: str, args: list, arg: str):
     elif cmd in ("use", "switch"):
         with c.lock():
             if arg == "-":
-                c.switch_prev()
+                c.switch_prev(force=force)
             elif not arg:
                 if sys.stdin.isatty() and sys.stdout.isatty() and curses:
                     start_ui("codex")
                 else:
                     die("Usage: codex-switch switch <name|alias|email>")
             else:
-                c.use(arg)
+                c.use(arg, force=force)
     elif cmd == "-":
         with c.lock():
-            c.switch_prev()
+            c.switch_prev(force=force)
     elif cmd in ("list", "ls"):
         c.list()
     elif cmd in ("status", "current"):
         c.status()
     elif cmd == "next":
         with c.lock():
-            c.next()
+            c.next(force=force)
     elif cmd in ("remove", "rm"):
         with c.lock():
             all_flag = "--all" in args
@@ -2310,7 +2383,7 @@ def dispatch_codex(c: CodexClient, cmd: str, args: list, arg: str):
         print_codex_help()
     else:
         with c.lock():
-            c.use(cmd)
+            c.use(cmd, force=force)
 
 
 def main():
